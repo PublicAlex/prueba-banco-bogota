@@ -1,0 +1,180 @@
+name: Build y despliegue
+
+on:
+  push:
+    branches: [dev, staging, main]
+
+permissions:
+  contents: read
+  packages: write
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      entorno: ${{ steps.entorno.outputs.entorno }}
+      imagen: ${{ steps.entorno.outputs.imagen }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Definir entorno segun la rama
+        id: entorno
+        run: |
+          case "${GITHUB_REF_NAME}" in
+            main)    ENTORNO=prod ;;
+            staging) ENTORNO=staging ;;
+            dev)     ENTORNO=dev ;;
+          esac
+          echo "entorno=$ENTORNO" >> $GITHUB_OUTPUT
+          echo "imagen=ghcr.io/${GITHUB_REPOSITORY,,}:$ENTORNO" >> $GITHUB_OUTPUT
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+          cache: maven
+
+      - name: Compilar y correr tests
+        run: ./mvnw -B clean package
+
+      - name: Login en GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Construir y subir imagen
+        run: |
+          docker build -t ${{ steps.entorno.outputs.imagen }} .
+          docker push ${{ steps.entorno.outputs.imagen }}
+
+  deploy:
+    needs: build
+    runs-on: self-hosted
+    environment: ${{ needs.build.outputs.entorno }}
+    env:
+      ENTORNO: ${{ needs.build.outputs.entorno }}
+      IMAGEN: ${{ needs.build.outputs.imagen }}
+      DB_URL: ${{ secrets.DB_URL }}
+    steps:
+      - name: Login en GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Desplegar contenedor
+        run: |
+          case "$ENTORNO" in
+            prod)    PUERTO=9090 ;;
+            staging) PUERTO=8083 ;;
+            dev)     PUERTO=8080 ;;
+          esac
+
+          # DB_URL solo si esta configurado el secret
+          EXTRA=""
+          if [ -n "$DB_URL" ]; then
+            EXTRA="-e DB_URL=$DB_URL"
+          fi
+
+          docker pull $IMAGEN
+          docker rm -f customers-$ENTORNO || true
+          docker run -d \
+            --name customers-$ENTORNO \
+            --restart unless-stopped \
+            -p $PUERTO:$PUERTO \
+            -e SPRING_PROFILES_ACTIVE=$ENTORNO \
+            $EXTRA \
+            -v customers-$ENTORNO-data:/app/data \
+            $IMAGEN
+
+      - name: Verificar que la app responde
+        run: |
+          case "$ENTORNO" in
+            prod)    PUERTO=9090 ;;
+            staging) PUERTO=8083 ;;
+            dev)     PUERTO=8080 ;;
+          esac
+
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:$PUERTO/api/clientes > /dev/null; then
+              echo "App en $ENTORNO respondiendo en el puerto $PUERTO"
+              docker logs customers-$ENTORNO 2>&1 | grep "Ejecutando en"
+              exit 0
+            fi
+            sleep 2
+          done
+          echo "La app no respondio"
+          docker logs customers-$ENTORNO
+          exit 1
+
+  estres:
+    needs: [build, deploy]
+    if: needs.build.outputs.entorno == 'staging'
+    runs-on: self-hosted
+    env:
+      IMAGEN: ${{ needs.build.outputs.imagen }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Levantar contenedor temporal para la prueba
+        run: |
+          docker rm -f customers-estres || true
+          docker run -d --name customers-estres -p 18083:8083 -e SPRING_PROFILES_ACTIVE=staging $IMAGEN
+          for i in $(seq 1 30); do
+            curl -sf http://localhost:18083/api/clientes > /dev/null && exit 0
+            sleep 2
+          done
+          exit 1
+
+      - name: Prueba de estres
+        run: |
+          CARPETA=$HOME/estres/$(date +%Y-%m-%d_%H%M%S)
+          mkdir -p $CARPETA
+          echo "Resultados en $CARPETA"
+
+          (while true; do
+            docker stats --no-stream --format '{{.CPUPerc}};{{.MemUsage}}' customers-estres >> $CARPETA/stats.txt
+          done) &
+          MONITOR=$!
+
+          docker run --rm --network host --user $(id -u) \
+            -v $PWD/estres:/scripts -v $CARPETA:/resultados \
+            grafana/k6 run --summary-export=/resultados/k6.json \
+            -e URL=http://localhost:18083/api/clientes /scripts/carga.js \
+            2>&1 | tee $CARPETA/k6.log
+          RESULTADO=${PIPESTATUS[0]}
+
+          kill $MONITOR
+
+          LC_ALL=C awk -F';' '
+            {
+              cpu = $1; sub("%", "", cpu); cpu += 0
+              split($2, m, " "); mem = m[1]
+              if (mem ~ /GiB/) { sub("GiB", "", mem); mem *= 1024 }
+              else if (mem ~ /KiB/) { sub("KiB", "", mem); mem /= 1024 }
+              else { sub("MiB", "", mem) }
+              mem += 0
+              sumCpu += cpu; sumMem += mem; n++
+              if (cpu > maxCpu) maxCpu = cpu
+              if (mem > maxMem) maxMem = mem
+            }
+            END {
+              print "### Consumo en prueba de estres (staging)"
+              print ""
+              print "| | Promedio | Maximo |"
+              print "|---|---|---|"
+              printf "| CPU | %.1f %% | %.1f %% |\n", sumCpu / n, maxCpu
+              printf "| RAM | %.0f MiB | %.0f MiB |\n", sumMem / n, maxMem
+              print ""
+              print "Muestras: " n
+            }' $CARPETA/stats.txt | tee $CARPETA/resumen.md >> $GITHUB_STEP_SUMMARY
+          cat $CARPETA/resumen.md
+
+          exit $RESULTADO
+
+      - name: Eliminar contenedor temporal
+        if: always()
+        run: docker rm -f customers-estres || true
