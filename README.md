@@ -16,13 +16,53 @@ El proyecto se creo con Spring Initializr (Maven) con estas dependencias:
 
 ## Entornos
 
-Hay tres perfiles: `dev`, `staging` y `prod`. Por defecto arranca en dev.
+Cada entorno tiene su propio archivo `application-{entorno}.properties`:
 
-- dev: puerto 8080
-- staging: puerto 8083
-- prod: puerto 8082 (se puede cambiar con `PORT` y la base con `DB_URL`)
+| Entorno | Rama    | Nombre app        | Puerto | Mensaje en el log     |
+|---------|---------|-------------------|--------|-----------------------|
+| dev     | dev     | customers-dev     | 8080   | Ejecutando en DEV     |
+| staging | staging | customers-staging | 8083   | Ejecutando en STAGING |
+| prod    | main    | customers-prod    | 9090   | Ejecutando en PROD    |
 
 Swagger esta disponible en dev y staging en `/swagger-ui.html`.
+
+## Construir
+
+```bash
+./mvnw clean package
+```
+
+Genera `target/app.jar`.
+
+## Ejecutar
+
+Dev:
+
+```bash
+java -jar target/app.jar --spring.profiles.active=dev
+```
+
+Prod:
+
+```bash
+java -jar target/app.jar --spring.profiles.active=prod
+```
+
+## Docker
+
+```bash
+docker build -t customers .
+docker run -p 9090:9090 -e SPRING_PROFILES_ACTIVE=prod customers
+```
+
+## Despliegue
+
+El workflow `.github/workflows/deploy.yml` se ejecuta con cada push a `dev`, `staging` o `main`:
+
+1. Compila y corre los tests.
+2. Construye la imagen Docker y la sube a GitHub Container Registry con el tag del entorno.
+3. En el servidor (runner self-hosted) baja la imagen y levanta el contenedor `customers-{entorno}` en su puerto.
+4. Solo en staging: corre una prueba de estres con k6 (`estres/carga.js`, 20 usuarios durante 1 minuto) y muestra el promedio de CPU y RAM en el resumen del workflow. Los resultados tambien quedan en el servidor en `~/estres/{fecha}/`.
 
 ## Endpoints
 
